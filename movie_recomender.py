@@ -1,11 +1,9 @@
-import concurrent
 import threading
 
 from neo4j import GraphDatabase
 from config import URI, CSV_URL, AUTH
 import pandas as pd
 import ast
-import queue
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -15,96 +13,154 @@ class MoveRecommender:
         self.df = pd.read_csv('crawled_movie.csv')
         self.driver = GraphDatabase.driver(URI, auth=AUTH)
         # self.__initials_nodes(csv_dataframe=self.df)
-        # self.__initials_actors_relations()
-        self.__initial_director_relation()
+        # self.__index_nodes()
+        # self.__initials_relations(csv_dataframe=self.df)
+
+    def __create_movie_node(self, csv_row):
+        query = """  
+        MERGE (:Movie {
+            Title: $Title,
+            USER_SCORE: $USER_SCORE,
+            Runtime: $Runtime,
+            Languages: $Languages,
+            METASCORE: $METASCORE,
+            Genrs: $Genrs,
+            Countries: $Countries,
+            url: $url
+            })
+            """
+        self.__execute_query(query, csv_row.to_dict())
+        print(f"movie node created successfully")
+
+    def __create_simple_node(self, label, name):
+        # create a new node with name property
+        query = f"""
+            MERGE (:{label} {{Name: $Name}})
+            """
+        self.__execute_query(query, {'Name': name})
+        print(f"{label.lower()} node created")
+
+    def __create_relation(self, movie_title, relation_name, tail_node_label, tail_node_name):
+        query = f"""
+            MATCH (movie:Movie),(tail:{tail_node_label})
+            WHERE movie.Title ="{movie_title.replace('"', '""')}" AND
+            tail.Name ="{tail_node_name.replace('"', '""')}"
+            MERGE (tail)-[:{relation_name}]->(movie)
+                """
+        self.__execute_query(query)
+        print(f"{tail_node_name}--{relation_name}--->{movie_title}")
 
     def __initials_nodes(self, csv_dataframe):
-        query = "CREATE (n:Movie{Title:$Title, USER_SCORE:$USER_SCORE, Runtime:$Runtime, Languages:$Languages, " \
-                "METASCORE:$METASCORE, Genrs:$Genrs, Countries:$Countries, Writers:$Writers, Cast:$Cast, " \
-                "Director:$Director, url:$url})"
+        # creating set for director, actor, writer, Genres to avoid using merge in cypher language
+        # we use thread to increase the process speed
 
-        """in this part i'm extracting the movie detail from dataframe and turn to
-         a dictionary that contain parameters to create a new node"""
-        for index, row in csv_dataframe.iterrows():
-            params = dict()
-            for i in range(len(row)):
-                try:
-                    params[row.keys()[i]] = ast.literal_eval(row[i])
-                except (ValueError, SyntaxError):
-                    params[row.keys()[i]] = row[i]
-            print(params)
-            self.__execute_query(query, params)
+        def fill_set(input_set, column_name):
+            for row in self.df[column_name]:
+                row = ast.literal_eval(row)
+                for data in row:
+                    input_set.add(data)
 
-    def __initials_actors_relations(self):
-        """getting all the node title and actor"""
-        query = "MATCH (n:Movie) RETURN n.Title as title, n.Cast as actor"
+        # using ThreadPool to run the above def
+        director_set = set()
+        actor_set = set()
+        writer_set = set()
+        # fill the set
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.submit(fill_set, director_set, "Director")
+            executor.submit(fill_set, actor_set, "Cast")
+            executor.submit(fill_set, actor_set, "PrincipleCast")
+            executor.submit(fill_set, writer_set, "Writers")
 
-        """create a list to get the result"""
-        result_list = list()
-        for i in self.__execute_query(query):
-            result_list.append(i)
+        # creating node base on dict and movie via dataframe
 
-        actors_list = list()  # list of created actor
+        # getting movie from csv
+        movie_list = [movie for index, movie in csv_dataframe.iterrows()]
+        # insert the data(nodes) in neo4j database
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            executor.map(self.__create_movie_node, movie_list)
+            executor.map(self.__create_simple_node, ["Actor"] * len(actor_set), actor_set)
+            executor.map(self.__create_simple_node, ["Writer"] * len(writer_set), writer_set)
+            executor.map(self.__create_simple_node, ["Director"] * len(director_set), director_set)
 
-        def __create_actor_relation(movie_dict):
-            """we see this actor for the first time ,so we create a node and also a relation for it"""
-            for actor in movie_dict['actor']:
-                if actor not in actors_list:
-                    """we see this actor for the first time"""
-                    query = "CREATE (n:Actor{name:$name})"
-                    self.__execute_query(query, {"name": actor})
+        # at the end creating the Genre
+        Genre = ['Genre', 'Adventure', 'Animation', 'Biography', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family',
+                 'Fantasy', 'Film-Noir', 'History', 'Horror', 'Music', 'Musical', 'Mystery', 'News', 'Reality-TV',
+                 'Romance', 'Sci-Fi', 'Short', 'Sport', 'Thriller', 'War', 'Western']
 
-                    actors_list.append(actor)
-                    print(f"{actor}: actor node created")
+        for genres_name in Genre:
+            self.__create_simple_node("Genre", genres_name)
 
-                """ create the relation between actor and the movie"""
-                relation_query = "Match (a:Movie),(b:Actor) WHERE a.Title = $Title AND b.name =$Actor " \
-                                 "CREATE (b)-[:Acted_in]->(a) "
-                self.__execute_query(relation_query, {"Actor": actor, "Title": movie_dict['title']})
+    def __index_nodes(self):
+        # keys are the label name and values are the nodes property
+        details = {"Movie": "Title",
+                   "Director": "Name",
+                   "Actor": "Name",
+                   "Writer": "Name",
+                   }
 
-        """multi thread the process to increase performance"""
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            executor.map(__create_actor_relation, result_list)
+        for label in details:
+            indexing_query = f"""
+                    CREATE INDEX {label}_{details[label]} FOR (n:{label}) ON (n.{details[label]})
+                    """
+            self.__execute_query(indexing_query)
+            print(f"INDEX {label}_{details[label]} created")
 
-    def __initial_director_relation(self):
-        """getting all the node title and director"""
-        query = "MATCH (n:Movie) RETURN n.Title as title, n.Director as director"
+    def __initials_relations(self, csv_dataframe):
+        # relation are from nodes to movie node
+        def __create_relations(row):
+            # relation for actor nodes
+            for actor in ast.literal_eval(row.Cast):
+                self.__create_relation(movie_title=row.Title, relation_name="ACTED_IN",
+                                       tail_node_label="Actor", tail_node_name=actor)
+            for actor in ast.literal_eval(row.PrincipleCast):
+                self.__create_relation(movie_title=row.Title, relation_name="ACTED_IN",
+                                       tail_node_label="Actor", tail_node_name=actor)
 
-        """create a list to get the result"""
-        result_list = list()
-        for i in self.__execute_query(query):
-            result_list.append(i)
+            # create relation for Director
+            for director in ast.literal_eval(row.Director):
+                self.__create_relation(movie_title=row.Title, relation_name="DIRECTED",
+                                       tail_node_label="Director", tail_node_name=director)
+            # create relation for Writer
+            for writer in ast.literal_eval(row.Writers):
+                self.__create_relation(movie_title=row.Title, relation_name="WRITEN",
+                                       tail_node_label="Writer", tail_node_name=writer)
 
-        director_list = list()  # list of created Director
+            # create relation for Genre
+            for genre in ast.literal_eval(row.Genrs):
+                self.__create_relation(movie_title=row.Title, relation_name="GENRE",
+                                       tail_node_label="Genre", tail_node_name=genre)
 
-        def __create_director_relation(movie_dict):
-            """we see this actor for the first time ,so we create a node and also a relation for it"""
-            for director in movie_dict['director']:
-                if director not in director_list:
-                    """we see this director for the first time"""
-                    query = "CREATE (n:Director{name:$name})"
-                    self.__execute_query(query, {"name": director})
-
-                    director_list.append(director)
-                    print(f"{director}: director node created")
-
-                """ create the relation between director and the movie"""
-                relation_query = "Match (a:Movie),(b:Director) WHERE a.Title = $Title AND b.name =$Director " \
-                                 "CREATE (b)-[:Directed]->(a) "
-                self.__execute_query(relation_query, {"Director": director, "Title": movie_dict['title']})
-
-        """multi thread the process to increase performance"""
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            executor.map(__create_director_relation, result_list)
+        # run a thread for each node in data frame
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(__create_relations, row) for _, row in self.df.iterrows()]
 
     def __execute_query(self, query, params=None):
         with self.driver.session() as session:
             result = session.run(query, **params) if params else session.run(query)
             return result.data()
 
-    def stream_or_download(self, title):
+    def __recommend_movie(self, movie_title):
+        # this query find if any other movie by this actor have been played and return the movies that have more than 4
+        # relation
+
+        query = (
+            f"MATCH (movie:Movie {{Title: '{movie_title}'}})<-[r:WRITEN|DIRECTED|ACTED_IN]-(person),"
+            f"(person)-[r2]->(recommended_movie),"
+            f"(:Movie {{Title: '{movie_title}'}})<-[r3:GENRE]-(movie_genre),"
+            f"(movie_genre)-[r4:GENRE]->(recommended_movie) "
+            "WITH recommended_movie, COUNT(DISTINCT r2) + COUNT(DISTINCT r4) AS totalRelations "
+            "WHERE totalRelations > 4 "
+            "RETURN recommended_movie"
+        )
+        return self.__execute_query(query)
+
+    def stream_or_download(self, movie_title):
         """When a movie is started or downloaded, this method gives a recommendation"""
-        pass
+        return self.__recommend_movie(movie_title=movie_title)
 
 
-MoveRecommender()
+if __name__ == "__main__":
+    recommender = MoveRecommender()
+    recommended_movie = recommender.stream_or_download('The Batman')
+    for i in recommended_movie:
+        print(i['recommended_movie']['Title'])
