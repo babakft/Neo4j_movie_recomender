@@ -1,5 +1,4 @@
-import threading
-
+import time
 from neo4j import GraphDatabase
 from config import URI, CSV_URL, AUTH
 import pandas as pd
@@ -10,11 +9,26 @@ from concurrent.futures import ThreadPoolExecutor
 class MoveRecommender:
     def __init__(self):
         """Create the whole graph and relation via the csv file"""
-        self.df = pd.read_csv('crawled_movie.csv')
-        self.driver = GraphDatabase.driver(URI, auth=AUTH)
-        # self.__initials_nodes(csv_dataframe=self.df)
-        # self.__index_nodes()
-        # self.__initials_relations(csv_dataframe=self.df)
+        self.driver = GraphDatabase.driver(URI, auth=AUTH, encrypted=True, trust='TRUST_ALL_CERTIFICATES',
+                                           max_connection_lifetime=3600 * 24 * 30, keep_alive=True,
+                                           max_connection_pool_size=500)
+        time.sleep(75)  # waiting to get connected to neo4j azura
+        self.driver.verify_connectivity()
+        self.df = pd.read_csv(CSV_URL)  # the CSV file that contains all the data
+        self.__initials_nodes(csv_dataframe=self.df)
+        # check if the initialization already happened in server to don't recreate indexes again
+        if self.__is_initialized() is False:
+            self.__index_nodes()
+
+        self.__initials_relations(csv_dataframe=self.df)
+
+    def __is_initialized(self):
+        query = """
+        MATCH (n) RETURN count(n) AS nodeCount;
+        """
+        if int(self.__execute_query(query)[0]['nodeCount']) == 0:
+            return False
+        return True
 
     def __create_movie_node(self, csv_row):
         query = """  
@@ -76,7 +90,7 @@ class MoveRecommender:
         # getting movie from csv
         movie_list = [movie for index, movie in csv_dataframe.iterrows()]
         # insert the data(nodes) in neo4j database
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             executor.map(self.__create_movie_node, movie_list)
             executor.map(self.__create_simple_node, ["Actor"] * len(actor_set), actor_set)
             executor.map(self.__create_simple_node, ["Writer"] * len(writer_set), writer_set)
@@ -142,7 +156,7 @@ class MoveRecommender:
     def __recommend_movie(self, movie_title):
         # this query find if any other movie by this actor have been played and return the movies that have more than 4
         # relation
-
+        movie_title = movie_title.replace('"', '""')
         query = (
             f"MATCH (movie:Movie {{Title: '{movie_title}'}})<-[r:WRITEN|DIRECTED|ACTED_IN]-(person),"
             f"(person)-[r2]->(recommended_movie),"
@@ -161,6 +175,3 @@ class MoveRecommender:
 
 if __name__ == "__main__":
     recommender = MoveRecommender()
-    recommended_movie = recommender.stream_or_download('The Batman')
-    for i in recommended_movie:
-        print(i['recommended_movie']['Title'])
